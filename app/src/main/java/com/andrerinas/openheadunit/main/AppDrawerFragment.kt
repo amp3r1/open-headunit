@@ -24,6 +24,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.R
 import com.andrerinas.openheadunit.utils.AppLog
+import com.andrerinas.openheadunit.utils.SystemUI
 import com.google.android.material.appbar.MaterialToolbar
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -107,9 +108,15 @@ class AppDrawerFragment : DialogFragment() {
 
     override fun onStart() {
         super.onStart()
-        if (dialog != null) {
-            view?.let { applyHudMirroring(it) }
-        }
+        val ctx = context ?: return
+        val appSettings = App.provide(ctx).settings
+
+        dialog?.window?.let { win ->
+            win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            val root = view ?: win.findViewById<View>(android.R.id.content) ?: win.decorView
+            SystemUI.apply(win, root, appSettings.fullscreenMode, notesCanvas = false)
+            applyHudMirroring(root)
+        } ?: view?.let { applyHudMirroring(it) }
     }
 
     private fun applyHudMirroring(view: View) {
