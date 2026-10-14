@@ -9,7 +9,10 @@ import android.hardware.usb.UsbDevice
 import android.location.Location
 import android.media.AudioManager
 import android.os.Build
+import com.andrerinas.openheadunit.input.KeyCode
 import com.andrerinas.openheadunit.input.MediaKeyRoutingPolicy
+import com.andrerinas.openheadunit.view.PerformanceOverlayField
+import com.andrerinas.openheadunit.view.PerformanceOverlayPolicy
 import com.andrerinas.openheadunit.decoder.video.VideoFaultInjector
 import com.andrerinas.openheadunit.decoder.video.DeviceMemoryProfile
 import com.andrerinas.openheadunit.decoder.audio.PlaybackFocusPolicy
@@ -21,6 +24,7 @@ import com.andrerinas.openheadunit.connection.usb.UsbDeviceCompat
 import com.andrerinas.openheadunit.connection.wifi.direct.GroupIdentityStability
 import com.andrerinas.openheadunit.connection.wifi.direct.ObservedP2pCredentials
 import com.andrerinas.openheadunit.connection.wifi.direct.ObservedP2pGroup
+import com.andrerinas.openheadunit.connection.wifi.direct.StationStandDownReassertPolicy
 import com.andrerinas.openheadunit.connection.wifi.direct.StoredP2pIdentity
 import com.andrerinas.openheadunit.connection.wifi.modes.helper.HelperStrategy
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeDriverSelectionPolicy
@@ -65,7 +69,12 @@ class Settings(private val context: Context) {
 
     var bluetoothAddress: String
         get() = prefs.getString("bt-address", "")!!
+            .let { if (BluetoothAddressSeedPolicy.isLegacyDefault(it)) "" else it }
         set(value) = prefs.edit().putString("bt-address", value).apply()
+
+    var bluetoothAnnounceMode: String?
+        get() = prefs.getString("bt-announce", null)
+        set(value) = prefs.edit().putString("bt-announce", value).apply()
 
     var lastKnownLocation: Location
         get() {
@@ -127,6 +136,14 @@ class Settings(private val context: Context) {
         get() = prefs.getBoolean("enable-floating-button", false)
         set(value) { prefs.edit().putBoolean("enable-floating-button", value).apply() }
 
+    var floatingButtonConnectionStatusMode: Boolean
+        get() = prefs.getBoolean("floating-button-connection-status-mode", false)
+        set(value) { prefs.edit().putBoolean("floating-button-connection-status-mode", value).apply() }
+
+    var floatingButtonDisconnectedOpacityPercent: Int
+        get() = prefs.getInt("floating-button-disconnected-opacity-percent", 10)
+        set(value) { prefs.edit().putInt("floating-button-disconnected-opacity-percent", value.coerceIn(0, 100)).apply() }
+
     var floatingButtonXPercent: Int
         get() = prefs.getInt("floating-button-x-percent", 0)
         set(value) { prefs.edit().putInt("floating-button-x-percent", value.coerceIn(0, 100)).apply() }
@@ -137,7 +154,7 @@ class Settings(private val context: Context) {
 
     var floatingButtonOpacityPercent: Int
         get() = prefs.getInt("floating-button-opacity-percent", 80)
-        set(value) { prefs.edit().putInt("floating-button-opacity-percent", value.coerceIn(0, 100)).apply() }
+        set(value) { prefs.edit().putInt("floating-button-opacity-percent", value.coerceIn(10, 100)).apply() }
 
     var floatingButtonSizeDp: Int
         get() = prefs.getInt("floating-button-size-dp", 60)
@@ -156,7 +173,7 @@ class Settings(private val context: Context) {
 
     var rawAaExitAction: ExitAction
         get() {
-            val value = prefs.getInt("aa-exit-action", ExitAction.OEM_LAUNCHER.value)
+            val value = prefs.getInt("aa-exit-action", ExitAction.DISCONNECT.value)
             return ExitAction.fromInt(value)
         }
         set(action) {
@@ -170,7 +187,7 @@ class Settings(private val context: Context) {
 
         companion object {
             private val map = values().associateBy(ExitAction::value)
-            fun fromInt(value: Int) = map[value] ?: OEM_LAUNCHER
+            fun fromInt(value: Int) = map[value] ?: DISCONNECT
         }
     }
 
@@ -254,8 +271,7 @@ class Settings(private val context: Context) {
     var nightMode: NightMode
         get() {
             val value = prefs.getInt("night-mode", 0)
-            val mode = NightMode.fromInt(value)
-            return mode!!
+            return NightMode.fromInt(value) ?: NightMode.AUTO
         }
         set(nightMode) {
             prefs.edit().putInt("night-mode", nightMode.value).apply()
@@ -281,7 +297,9 @@ class Settings(private val context: Context) {
                 val codes = it.split("-")
                 map[codes[0].toInt()] = codes[1].toInt()
             }
-            return map
+            val migrated = KeyCode.migrateLegacyNightKey(map)
+            if (migrated != map) keyCodes = migrated.toMutableMap()
+            return migrated.toMutableMap()
         }
         set(codesMap) {
             val list: List<String> = codesMap.map { "${it.key}-${it.value}" }
@@ -356,6 +374,11 @@ class Settings(private val context: Context) {
         set(value) {
             prefs.edit().putInt("dpi-pixel-density", value).apply()
         }
+
+    /** The wizard's screen size, a [SystemOptimizer.DisplaySizePreset] name; null until picked. */
+    var displaySizePreset: String?
+        get() = prefs.getString("display-size-preset", null)
+        set(value) { prefs.edit().putString("display-size-preset", value).apply() }
 
     var pixelAspectRatioE4: Int
         get() = prefs.getInt("pixel-aspect-ratio-e4", 10000) // Default 10000 = 1.0 (square pixels)
@@ -623,7 +646,26 @@ class Settings(private val context: Context) {
             prefs.getBoolean("stand-down-station-for-wifi-direct", false) -> 1
             else -> 0
         }
-        set(value) { prefs.edit().putInt("stand-down-station-mode", value).apply() }
+        set(value) {
+            val clears = StationStandDownReassertPolicy.modeChangeClearsVerdict(stationStandDownMode, value)
+            prefs.edit().apply {
+                putInt("stand-down-station-mode", value)
+                if (clears) remove("station-stand-down-contested-fingerprint")
+            }.apply()
+        }
+
+    /**
+     * Build.FINGERPRINT of a ROM that undid every re-assertion of the stand-down, or null.
+     * In force only on that ROM; changing the stand-down mode clears it.
+     */
+    var stationStandDownContestedFingerprint: String?
+        get() = prefs.getString("station-stand-down-contested-fingerprint", null)
+        set(value) {
+            prefs.edit().apply {
+                if (value == null) remove("station-stand-down-contested-fingerprint")
+                else putString("station-stand-down-contested-fingerprint", value)
+            }.apply()
+        }
 
     /**
      * The network id disabled by the WiFi Direct station stand-down, or -1 for none standing.
@@ -772,6 +814,21 @@ class Settings(private val context: Context) {
                 .apply()
         }
 
+    /** The WiFi Direct group's IP as last read on a create, graded by SoftApEndpointStabilityPolicy. */
+    var wifiDirectAddressRecord: SoftApAddressRecord?
+        get() {
+            val ip = prefs.getString("wifi-direct-last-ip", null) ?: return null
+            val digest = prefs.getString("wifi-direct-last-ip-psk-digest", null) ?: return null
+            return SoftApAddressRecord(ip, digest, null, prefs.getBoolean("wifi-direct-ip-repeated", false))
+        }
+        set(value) {
+            prefs.edit()
+                .putString("wifi-direct-last-ip", value?.ip)
+                .putString("wifi-direct-last-ip-psk-digest", value?.passphraseDigest)
+                .putBoolean("wifi-direct-ip-repeated", value?.spannedBoot ?: false)
+                .apply()
+        }
+
     /** The access point a WPP endpoint last went out on, so a bring-up that moved it can say so. */
     var softApAdvertisedEndpoint: SoftApAdvertisedEndpoint?
         get() {
@@ -787,6 +844,24 @@ class Settings(private val context: Context) {
                 .putString("soft-ap-advertised-psk-digest", value?.passphraseDigest)
                 .putString("soft-ap-advertised-bssid", value?.bssid)
                 .putString("soft-ap-advertised-ip", value?.ip)
+                .apply()
+        }
+
+    /** The WiFi Direct group an endpoint last went out on, kept apart from the identity retirement clears. */
+    var wifiDirectAdvertisedEndpoint: SoftApAdvertisedEndpoint?
+        get() {
+            val ssid = prefs.getString("wifi-direct-advertised-endpoint-ssid", null) ?: return null
+            val digest = prefs.getString("wifi-direct-advertised-endpoint-psk-digest", null) ?: return null
+            val bssid = prefs.getString("wifi-direct-advertised-endpoint-bssid", null) ?: return null
+            val ip = prefs.getString("wifi-direct-advertised-endpoint-ip", null) ?: return null
+            return SoftApAdvertisedEndpoint(ssid, digest, bssid, ip)
+        }
+        set(value) {
+            prefs.edit()
+                .putString("wifi-direct-advertised-endpoint-ssid", value?.ssid)
+                .putString("wifi-direct-advertised-endpoint-psk-digest", value?.passphraseDigest)
+                .putString("wifi-direct-advertised-endpoint-bssid", value?.bssid)
+                .putString("wifi-direct-advertised-endpoint-ip", value?.ip)
                 .apply()
         }
 
@@ -1168,11 +1243,10 @@ class Settings(private val context: Context) {
         get() = prefs.getInt("mic-input-source", 0) // Default: DEFAULT
         set(value) { prefs.edit().putInt("mic-input-source", value).apply() }
 
-    // 16 banks 400ms, which is AudioJitterBufferPolicy's ceiling and the only setting measured to
-    // produce no audible stutter on the rig's phone-to-phone pairing. Nothing else writes this key,
-    // so a user who saved 8 keeps 8 and one who never opened the picker moves.
+    // Keep the existing default when this key is absent. Explicit low-latency choices
+    // still use the adaptive sink, and saved values are never migrated implicitly.
     var audioLatencyMultiplier: Int
-        get() = prefs.getInt("audio-latency-multiplier", 16)
+        get() = prefs.getInt("audio-latency-multiplier", com.andrerinas.openheadunit.decoder.audio.AudioJitterBufferPolicy.DEFAULT_MULTIPLIER)
         set(value) { prefs.edit().putInt("audio-latency-multiplier", value).apply() }
 
     // Chunks the audio thread may hold before it starts dropping, or 0 for no limit. Bounded by
@@ -1193,6 +1267,11 @@ class Settings(private val context: Context) {
     var useAacAudio: Boolean
         get() = prefs.getBoolean("use-aac-audio", false)
         set(value) { prefs.edit().putBoolean("use-aac-audio", value).apply() }
+
+    // Experimental backend: keep AudioTrack unless the user explicitly opts in.
+    var useAAudioOutput: Boolean
+        get() = prefs.getBoolean("use-aaudio-output", false)
+        set(value) { prefs.edit().putBoolean("use-aaudio-output", value).apply() }
 
     var micEchoCanceler: Boolean
         get() = prefs.getBoolean("mic-echo-canceler", false)
@@ -1574,7 +1653,8 @@ class Settings(private val context: Context) {
         LIGHT_SENSOR(4),
         SCREEN_BRIGHTNESS(5),
         CAR_SIGNAL(6),
-        LOCATION(7);
+        LOCATION(7),
+        SYSTEM(8);
 
         companion object {
             private val map = NightMode.values().associateBy(NightMode::value)
@@ -1671,6 +1751,15 @@ class Settings(private val context: Context) {
         }
         set(value) {
             prefs.edit().putInt("overlay-position", value.value).apply()
+        }
+
+    // One bit per overlay line; the default keeps all four.
+    var overlayFields: Set<PerformanceOverlayField>
+        get() = PerformanceOverlayPolicy.fromBits(
+            prefs.getInt("overlay-fields", PerformanceOverlayPolicy.DEFAULT_BITS)
+        )
+        set(value) {
+            prefs.edit().putInt("overlay-fields", PerformanceOverlayPolicy.toBits(value)).apply()
         }
 
     companion object {
@@ -2207,16 +2296,6 @@ class Settings(private val context: Context) {
         get() = NativeStrategy.byIdOrDefault(prefs.getInt("native-ap-transport", -1))
         set(value) = prefs.edit().putInt("native-ap-transport", value.id).apply()
 
-    // Whether ServiceDiscoveryResponse carries a ConnectionConfiguration: the ping and TCP
-    // parameters Android Auto lets a head unit ask for.
-    //
-    // Off by default. It is aimed at the link outages that kill a session mid-drive, where the
-    // protocol's own 3 s ping timeout fires long before the link is actually gone, but whether the
-    // phone honours any of it is unmeasured. See ConnectionConfigPolicy for the values.
-    var announceConnectionConfiguration: Boolean
-        get() = prefs.getBoolean("announce-connection-configuration", false)
-        set(value) = prefs.edit().putBoolean("announce-connection-configuration", value).apply()
-
     var nativeDriverSelectionMode: NativeDriverSelectionPolicy.Mode
         get() = NativeDriverSelectionPolicy.Mode.fromId(
             prefs.getInt("native-driver-selection-mode", NativeDriverSelectionPolicy.Mode.AUTO.id)
@@ -2322,6 +2401,15 @@ class Settings(private val context: Context) {
     var connectionIssueStaleEndpointAtEpochMs: Long
         get() = prefs.getLong("connection-issue-stale-endpoint", 0L)
         set(value) = prefs.edit().putLong("connection-issue-stale-endpoint", value).apply()
+
+    /** The platform kept rejoining this unit's WiFi beside the group and the stand-down gave up. */
+    var connectionIssueHomeWifiRejoinedAtEpochMs: Long
+        get() = prefs.getLong("connection-issue-home-wifi-rejoined", 0L)
+        set(value) = prefs.edit().putLong("connection-issue-home-wifi-rejoined", value).apply()
+
+    var connectionIssueStaleUsbAccessoryAtEpochMs: Long
+        get() = prefs.getLong("connection-issue-stale-usb-accessory", 0L)
+        set(value) = prefs.edit().putLong("connection-issue-stale-usb-accessory", value).apply()
 
     /**
      * When the user last dismissed the failure banner.

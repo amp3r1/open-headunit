@@ -3,7 +3,6 @@ package com.andrerinas.openheadunit.aap.protocol.messages
 import android.content.Context
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.aap.AapMessage
-import com.andrerinas.openheadunit.aap.ConnectionConfigPolicy
 import com.andrerinas.openheadunit.aap.NarrowBandProfilePolicy
 import com.andrerinas.openheadunit.aap.VehicleIdentityPolicy
 import com.andrerinas.openheadunit.aap.VehicleTypePolicy
@@ -18,13 +17,15 @@ import com.andrerinas.openheadunit.connection.wifi.direct.WifiBandCapability
 import com.andrerinas.openheadunit.decoder.video.VideoDecoder
 import com.andrerinas.openheadunit.utils.AppLog
 import com.andrerinas.openheadunit.utils.HeadUnitScreenConfig
+import com.andrerinas.openheadunit.utils.VideoFallbackPolicy
+import com.andrerinas.openheadunit.aap.AudioSessionConfig
 import com.google.protobuf.Message
 
-class ServiceDiscoveryResponse(private val context: Context)
-    : AapMessage(Channel.ID_CTR, Control.ControlMsgType.MESSAGE_SERVICE_DISCOVERY_RESPONSE_VALUE, makeProto(context)) {
+internal class ServiceDiscoveryResponse(context: Context, audioConfig: AudioSessionConfig)
+    : AapMessage(Channel.ID_CTR, Control.ControlMsgType.MESSAGE_SERVICE_DISCOVERY_RESPONSE_VALUE, makeProto(context, audioConfig)) {
 
     companion object {
-        private fun makeProto(context: Context): Message {
+        private fun makeProto(context: Context, audioConfig: AudioSessionConfig): Message {
             val settings = App.provide(context).settings
             // Initialize HeadUnitScreenConfig with actual physical screen dimensions
             HeadUnitScreenConfig.init(context, context.resources.displayMetrics, settings)
@@ -85,6 +86,9 @@ class ServiceDiscoveryResponse(private val context: Context)
                         else -> Media.MediaCodecType.MEDIA_CODEC_VIDEO_H264_BP
                     }
 
+                    // A fallback adopted last session would leak into the margins read below.
+                    HeadUnitScreenConfig.recordAnnouncedFallback(null, 0, 0)
+
                     // Use HeadUnitScreenConfig for negotiated resolution and margins
                     val negotiatedResolution = HeadUnitScreenConfig.negotiatedResolutionType
                     val phoneWidthMargin = HeadUnitScreenConfig.getWidthMargin()
@@ -118,20 +122,51 @@ class ServiceDiscoveryResponse(private val context: Context)
                     logNegotiatedCodecCapability(effectiveCodec, announcedFps)
                     logNarrowBandProfile(context, settings)
                     AppLog.i("[ServiceDiscovery] Margins are: ${phoneWidthMargin}x${phoneHeightMargin}")
+                    val densityDecision = HeadUnitScreenConfig.densityDecision()
+                    AppLog.i("[ServiceDiscovery] Density is: " + com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.describe(
+                        densityDecision,
+                        HeadUnitScreenConfig.getNegotiatedWidth() - phoneWidthMargin,
+                        HeadUnitScreenConfig.getNegotiatedHeight() - phoneHeightMargin
+                    ))
                     AppLog.i("[ServiceDiscovery] PixelAspectRatioE4 is: ${HeadUnitScreenConfig.getPixelAspectRatioE4()} (10000 = square)")
 
+                    val announcedFrameRateType = when (announcedFps) {
+                        30 -> Control.Service.MediaSinkService.VideoConfiguration.VideoFrameRateType._30
+                        else -> Control.Service.MediaSinkService.VideoConfiguration.VideoFrameRateType._60
+                    }
+                    val announcedPar = HeadUnitScreenConfig.getPixelAspectRatioE4()
                     mediaSinkServiceBuilder.addVideoConfigs(Control.Service.MediaSinkService.VideoConfiguration.newBuilder().apply {
                         codecResolution = negotiatedResolution
-                        frameRate = when (announcedFps) {
-                            30 -> Control.Service.MediaSinkService.VideoConfiguration.VideoFrameRateType._30
-                            else -> Control.Service.MediaSinkService.VideoConfiguration.VideoFrameRateType._60
-                        }
-                        setDensity(HeadUnitScreenConfig.getDensityDpi()) // Use actual densityDpi
-                        setPixelAspectRatioE4(HeadUnitScreenConfig.getPixelAspectRatioE4())
+                        frameRate = announcedFrameRateType
+                        setDensity(densityDecision.announced)
+                        setPixelAspectRatioE4(announcedPar)
                         setMarginWidth(phoneWidthMargin)
                         setMarginHeight(phoneHeightMargin)
                         setVideoCodecType(effectiveCodec)
                     }.build())
+
+                    // A phone that refuses the first size walks the list, so give it one it accepts.
+                    val fallback = VideoFallbackPolicy.fallbackFor(negotiatedResolution)
+                    if (fallback != null) {
+                        val primarySize = VideoFallbackPolicy.sizeOf(negotiatedResolution)
+                        val margins = VideoFallbackPolicy.scaledMargins(
+                            primarySize.first, primarySize.second, phoneWidthMargin, phoneHeightMargin, fallback
+                        )
+                        HeadUnitScreenConfig.recordAnnouncedFallback(fallback, margins.width, margins.height)
+                        val fallbackDensity = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.fallbackDensity(
+                            densityDecision.announced, primarySize.first, VideoFallbackPolicy.sizeOf(fallback).first
+                        )
+                        AppLog.i("[ServiceDiscovery] Offering a $fallback fallback, margins ${margins.width}x${margins.height}, density $fallbackDensity")
+                        mediaSinkServiceBuilder.addVideoConfigs(Control.Service.MediaSinkService.VideoConfiguration.newBuilder().apply {
+                            codecResolution = fallback
+                            frameRate = announcedFrameRateType
+                            setDensity(fallbackDensity)
+                            setPixelAspectRatioE4(announcedPar)
+                            setMarginWidth(margins.width)
+                            setMarginHeight(margins.height)
+                            setVideoCodecType(effectiveCodec)
+                        }.build())
+                    }
                 }.build()
             }.build()
 
@@ -159,7 +194,7 @@ class ServiceDiscoveryResponse(private val context: Context)
 
             services.add(input)
 
-            val audioType = if (announcesAac(context, settings)) Media.MediaCodecType.MEDIA_CODEC_AUDIO_AAC_LC else Media.MediaCodecType.MEDIA_CODEC_AUDIO_PCM
+            val audioType = if (announcesAac(context, settings, audioConfig.aac)) Media.MediaCodecType.MEDIA_CODEC_AUDIO_AAC_LC else Media.MediaCodecType.MEDIA_CODEC_AUDIO_PCM
 
             // Always add Audio2 (System Sounds) to keep connection alive
             val audio2 = Control.Service.newBuilder().also { service ->
@@ -176,7 +211,7 @@ class ServiceDiscoveryResponse(private val context: Context)
             // the launchers run and a failed launch left it set, so a Native AA session announced
             // system sounds only and had no audio at all. See AudioSinkAnnouncementPolicy.
             val isSelfModeSession = App.provide(context).commManager.isLoopbackSession
-            if (AudioSinkAnnouncementPolicy.announcesMediaAndSpeech(settings.enableAudioSink, isSelfModeSession)) {
+            if (AudioSinkAnnouncementPolicy.announcesMediaAndSpeech(audioConfig.enabled, isSelfModeSession)) {
                 val audio1 = Control.Service.newBuilder().also { service ->
                     service.id = Channel.ID_AU1
                     service.mediaSinkService = Control.Service.MediaSinkService.newBuilder().also {
@@ -196,7 +231,7 @@ class ServiceDiscoveryResponse(private val context: Context)
                     }.build()
                 }.build()
                 services.add(audio0)
-            } else if (!settings.enableAudioSink) {
+            } else if (!audioConfig.enabled) {
                 // Without this line a muted head unit is indistinguishable from a broken one. The
                 // channels are never declared, so the phone never opens them, so nothing about the
                 // silence appears anywhere in the log and every audio instrument reads zero. It
@@ -242,11 +277,14 @@ class ServiceDiscoveryResponse(private val context: Context)
             }
 
             // Bluetooth Service
-            if (settings.bluetoothAddress.isNotEmpty()) {
+            val btAnnounce = BluetoothAnnouncePolicy.decide(
+                settings.bluetoothAnnounceMode, settings.bluetoothAddress,
+                App.provide(context).commManager.isUsbSession)
+            if (btAnnounce.carAddress != null) {
                 val bluetooth = Control.Service.newBuilder().also { service ->
                     service.id = Channel.ID_BTH
                     service.bluetoothService = Control.Service.BluetoothService.newBuilder().also {
-                        it.carAddress = settings.bluetoothAddress
+                        it.carAddress = btAnnounce.carAddress
                         // Pairing methods, not profiles: the old A2DP/HFP names on these two
                         // values said otherwise. The values are unchanged, and numeric
                         // comparison plus PIN is what Android's own stack offers a phone.
@@ -257,6 +295,12 @@ class ServiceDiscoveryResponse(private val context: Context)
                     }.build()
                 }.build()
                 services.add(bluetooth)
+                AppLog.i("Bluetooth service announced with carAddress=${btAnnounce.carAddress} " +
+                    "(bt-announce=${btAnnounce.mode.name.lowercase()})")
+                if (btAnnounce.skipNotApplied) {
+                    AppLog.i("bt-announce=skip applies to USB sessions only, so this session " +
+                        "announces the real address")
+                }
             } else {
                 // What the omission costs, in the user's terms. Android Auto keeps telephony
                 // disabled until a hands-free link is up, and this is the message that tells the
@@ -325,12 +369,6 @@ class ServiceDiscoveryResponse(private val context: Context)
                     // user's choice here.
                     setVehicleType(vehicleType)
                 }.build())
-
-                ConnectionConfigPolicy.announce(settings.announceConnectionConfiguration)?.let {
-                    setConnectionConfiguration(it)
-                    AppLog.i("[ServiceDiscovery] Asking for ping timeout ${it.pingConfiguration.timeoutMs}ms " +
-                            "and ${it.wirelessTcpConfiguration.socketReceiveBufferSize}B socket buffers")
-                }
 
                 addAllServices(services)
             }.build()
@@ -405,10 +443,11 @@ class ServiceDiscoveryResponse(private val context: Context)
          */
         private fun announcesAac(
             context: Context,
-            settings: com.andrerinas.openheadunit.utils.Settings
+            settings: com.andrerinas.openheadunit.utils.Settings,
+            userChoice: Boolean
         ): Boolean = try {
             val aac = NarrowBandProfilePolicy.useAac(
-                userChoice = settings.useAacAudio,
+                userChoice = userChoice,
                 supports5Ghz = WifiBandCapability.supports5Ghz(context),
                 wirelessSession = App.provide(context).commManager.isWirelessSession,
                 capEnabled = settings.narrowBandProfileCap,
@@ -416,13 +455,13 @@ class ServiceDiscoveryResponse(private val context: Context)
                 bandUnreadable = WifiBandCapability.bandUnreadable(),
                 linkProvedTooSlow = settings.videoProfileStarvationCap,
             )
-            if (aac && !settings.useAacAudio) {
+            if (aac && !userChoice) {
                 AppLog.i("[ServiceDiscovery] AAC audio announced by the 2.4 GHz cap (Use AAC Audio is off)")
             }
             aac
         } catch (e: Exception) {
             AppLog.d("[ServiceDiscovery] could not evaluate the band audio codec: ${e.message}")
-            settings.useAacAudio
+            userChoice
         }
 
         /**
