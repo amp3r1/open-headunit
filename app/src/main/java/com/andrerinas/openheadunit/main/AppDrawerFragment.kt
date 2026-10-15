@@ -23,6 +23,7 @@ import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.R
+import com.andrerinas.openheadunit.aap.AapProjectionActivity
 import com.andrerinas.openheadunit.utils.AppLog
 import com.andrerinas.openheadunit.utils.SystemUI
 import com.google.android.material.appbar.MaterialToolbar
@@ -144,6 +145,13 @@ class AppDrawerFragment : DialogFragment() {
         val rvApps = view.findViewById<RecyclerView>(R.id.rv_apps)
         val progressBar = view.findViewById<ProgressBar>(R.id.progress_bar)
         val tvEmpty = view.findViewById<TextView>(R.id.tv_empty)
+
+        val isFromProjection = activity is AapProjectionActivity || dialog != null
+        if (isFromProjection) {
+            toolbar.setNavigationIcon(R.drawable.ic_close_white)
+        } else {
+            toolbar.setNavigationIcon(R.drawable.ic_arrow_back_white)
+        }
 
         toolbar.setNavigationOnClickListener {
             closeDrawer()

@@ -19,6 +19,7 @@ import com.andrerinas.openheadunit.utils.Settings
 import com.andrerinas.openheadunit.utils.AppLog
 import android.widget.Toast
 import com.andrerinas.openheadunit.utils.LogExporter
+import com.andrerinas.openheadunit.utils.SystemUI
 import com.andrerinas.openheadunit.utils.ToastUtils
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.appbar.MaterialToolbar
@@ -72,7 +73,15 @@ class QuickSettingsFragment : DialogFragment() {
 
     override fun onStart() {
         super.onStart()
-        view?.let { applyHudMirroring(it) }
+        val ctx = context ?: return
+        val appSettings = App.provide(ctx).settings
+
+        dialog?.window?.let { win ->
+            win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            val root = view ?: win.findViewById<View>(android.R.id.content) ?: win.decorView
+            SystemUI.apply(win, root, appSettings.fullscreenMode, notesCanvas = false)
+            applyHudMirroring(root)
+        } ?: view?.let { applyHudMirroring(it) }
     }
 
     private fun applyHudMirroring(view: View) {
